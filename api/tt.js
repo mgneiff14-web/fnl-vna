@@ -24,5 +24,19 @@ module.exports = function handler(req, res) {
   };
   ttq.load("${id}");
   ttq.page();
+
+  // Evento que o servidor acabou de mandar ao TikTok (/api/pix e /api/status), disparado também pelo
+  // pixel com o MESMO event_id: o TikTok junta os dois em um só, com o cookie e o clique do navegador.
+  w.ttEvento = function (e) {
+    if (!e || !e.event) return;
+    try {
+      var u = e.user || {};
+      if (u.email || u.phone_number || u.external_id) ttq.identify(u);
+      ttq.track(e.event, {
+        value: e.value, currency: e.currency, content_type: "product",
+        contents: [{ content_id: e.content_id, content_name: e.content_name, quantity: 1, price: e.value }]
+      }, { event_id: e.event_id });
+    } catch (err) { /* medição nunca pode travar a página */ }
+  };
 }(window, document, "ttq");`);
 };

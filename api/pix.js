@@ -2,15 +2,15 @@
 // Cria a cobrança Pix na FlevoPay. O valor vem da tabela STEPS (_lib.js), nunca do navegador.
 const crypto = require("crypto");
 const {
-  STEPS, soDigitos, cpfValido, telefoneValido, reais, queryDaPagina, lerCorpo, flevo,
-  tokenDoWebhook, urlBase, lerCookie,
+  STEPS, soDigitos, cpfValido, telefoneValido, reais, queryDaPagina, lerCorpo, flevo, urlBase,
+  contextoDoNavegador, eventoParaOPixel, enviarEventoTikTok,
 } = require("./_lib");
 
 // Mesma etapa + mesmo CPF dentro da validade do Pix devolve o Pix que ja existe, em vez de abrir outra
 // cobranca na FlevoPay (cliques repetidos, "tentar de novo", varias abas). Fica na memoria da instancia:
 // protege as chamadas em sequencia; o front tambem reaproveita o Pix (api-pix.js).
 const VALIDADE_MS = 15 * 60 * 1000;
-const recentes = new Map();   // "etapa:cpf" -> { inicio, resultado } | { inicio, promessa }
+const recentes = new Map();   // "etapa:cpf" -> { inicio, promessa }
 
 function limparVencidos() {
   const agora = Date.now();
@@ -36,35 +36,34 @@ module.exports = async function handler(req, res) {
   if (!cpfValido(cpf)) return res.status(400).json({ error: "CPF inválido." });
   if (!telefoneValido(telefone)) return res.status(400).json({ error: "Telefone inválido (DDD + número)." });
 
+  // Só os UTMs, como no back end que já funciona.
   const q = queryDaPagina(req, body.utm);
   const tracking = {};
-  for (const k of ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "src", "sck"]) {
+  for (const k of ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"]) {
     if (q.get(k)) tracking[k] = q.get(k);
   }
 
   // O prefixo da referência é a etapa: o /api/status confere isso antes de aceitar uma consulta.
   const reference = `${step}-${Date.now()}-${crypto.randomBytes(3).toString("hex")}`;
 
-  // Webhook desta cobrança. O token prova que a URL saiu daqui; o resto é o contexto do cliente
-  // (a FlevoPay chama o webhook sozinha, sem cookie nem IP do navegador) para o Purchase do TikTok.
+  // URL do webhook simples, sem parâmetro nenhum, como no back end que já funciona. NÃO acrescentar
+  // dados aqui: a FlevoPay registra 8 ou 9 cobranças no lugar de uma quando o postback_url passa de
+  // 255 caracteres (medido: com 255 gera 1, com 256 gera 9). Era isso que duplicava as cobranças
+  // quando a URL levava token, IP e navegador.
   const base = urlBase(req);
-  let postbackUrl;
-  if (base) {
-    const p = new URLSearchParams({ k: tokenDoWebhook(reference) });
-    const ip = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
-    const ua = String(req.headers["user-agent"] || "").slice(0, 300);
-    const ttp = lerCookie(req, "_ttp");
-    if (ip) p.set("ip", ip);
-    if (ua) p.set("ua", ua);
-    if (ttp) p.set("ttp", ttp);
-    if (q.get("ttclid")) p.set("ttclid", q.get("ttclid"));
-    postbackUrl = `${base}/api/webhook?${p}`;
-  }
+  const postbackUrl = base ? base + "/api/webhook" : "";
+
+  // "Pix gerado" para o TikTok, com o clique e o navegador de quem está gerando. É este evento que
+  // liga o cliente (e-mail, telefone, CPF) ao anúncio; a compra depois chega com os mesmos dados.
+  const contexto = contextoDoNavegador(req, q);
+  const pixGerado = { evento: "InitiateCheckout", eventId: "ic_" + reference, step, cliente: { email, telefone, documento: cpf } };
 
   async function criarCobranca() {
     const t0 = Date.now();
     const r = await flevo("/transaction", {
       method: "POST",
+      // Sem resposta em 15 s, desiste: uma criação pendurada deixaria este CPF preso em `recentes`.
+      signal: AbortSignal.timeout(15000),
       body: JSON.stringify({
         amount: cfg.amount,
         description: cfg.name,
@@ -77,38 +76,46 @@ module.exports = async function handler(req, res) {
     });
 
     const d = r.dados || {};
-    console.log("[pix] FlevoPay respondeu", JSON.stringify({ reference, http: r.status, ms: Date.now() - t0, id: d.transaction_id }));
     if (!r.ok || d.status !== "success" || !d.qr_code || !d.transaction_id) {
       console.error("FlevoPay recusou a criação:", r.status, JSON.stringify(d));
       return null;
     }
-    return { pix_code: d.qr_code, payment_code: String(d.transaction_id), price_label: reais(cfg.amount) };
+    console.log("[pix] criada", JSON.stringify({
+      reference, id: String(d.transaction_id), ms: Date.now() - t0,
+    }));
+
+    // Prazo curto: se o TikTok demorar, o cliente não fica esperando o QR Code por causa da medição.
+    await enviarEventoTikTok({ ...pixGerado, contexto, prazo: 2500 });
+
+    return {
+      pix_code: d.qr_code,
+      payment_code: String(d.transaction_id),
+      price_label: reais(cfg.amount),
+      tiktok: eventoParaOPixel(pixGerado),   // a página dispara o mesmo evento pelo pixel
+    };
   }
 
   const chave = `${step}:${cpf}`;
-  // Diagnostico: cada linha e uma chamada a /api/pix (aparece nos Logs da Vercel).
-  console.log("[pix] chamada", JSON.stringify({
-    step, reference, repetida: recentes.has(chave),
-    referer: String(req.headers.referer || "").slice(0, 120),
-    ua: String(req.headers["user-agent"] || "").slice(0, 80),
-  }));
+  limparVencidos();
+  let existente = recentes.get(chave);
+  if (!existente) {
+    existente = { inicio: Date.now() };
+    existente.promessa = criarCobranca();
+    recentes.set(chave, existente);
+  }
+  // Se a criação falhar, libera a chave para tentar de novo (só a própria entrada, nunca uma mais nova).
+  const liberar = () => { if (recentes.get(chave) === existente) recentes.delete(chave); };
+
   try {
-    limparVencidos();
-    let existente = recentes.get(chave);
-    if (!existente) {
-      existente = { inicio: Date.now() };
-      existente.promessa = criarCobranca();
-      recentes.set(chave, existente);
-    }
-    // Chamadas simultaneas esperam a mesma criacao; se falhar, libera a chave para tentar de novo.
+    // Chamadas simultaneas esperam a mesma criacao.
     const resultado = await existente.promessa;
     if (!resultado) {
-      if (recentes.get(chave) === existente) recentes.delete(chave);
+      liberar();
       return res.status(502).json({ error: "Não foi possível gerar o Pix. Tente novamente." });
     }
     return res.status(200).json(resultado);
   } catch (e) {
-    if (recentes.get(chave)?.promessa) recentes.delete(chave);
+    liberar();
     console.error("Erro ao criar Pix:", e);
     return res.status(500).json({ error: "Erro interno ao gerar o Pix." });
   }

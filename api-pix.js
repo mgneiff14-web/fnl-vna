@@ -123,6 +123,14 @@
     } catch (e) { /* storage bloqueado */ }
   }
 
+  // Repassa ao pixel do TikTok o evento que o servidor acabou de mandar (mesmo event_id): o TikTok
+  // junta os dois. A funcao ttEvento vem do /api/tt.js; sem pixel configurado ela nao existe.
+  function rastrear(evento) {
+    if (!evento || typeof window.ttEvento !== 'function') return false;
+    window.ttEvento(evento);
+    return true;
+  }
+
   function criar(api, dados) {
     var chave = chaveCache();
     if (emAndamento[chave]) return emAndamento[chave];
@@ -169,6 +177,7 @@
       var id = corpo.payment_code;
       sessoes[id] = { inicio: Date.now(), ultima: 0, pendente: false };
       gravarCache(cpfLimpo, corpo.pix_code, id, sessoes[id].inicio);
+      rastrear(corpo.tiktok);   // "Pix gerado"
       var imagem = await imagemDoCodigo(corpo.pix_code);
       return { ok: true, json: async function () { return {
         qr_code: corpo.pix_code, qr_code_base64: imagem, transaction_id: id
@@ -197,7 +206,14 @@
         'code=' + encodeURIComponent(id), { signal: controle.signal, cache: 'no-store' });
       if (!r.ok) return vazio;
       var dados = await r.json();
-      return { json: async function () { return { pago: dados.status === 'approved' }; } };
+      var pago = dados.status === 'approved';
+      // Compra confirmada: o pixel dispara o mesmo evento do servidor. A pausa deixa o pedido do pixel
+      // sair antes de a pagina redirecionar para a proxima etapa.
+      if (pago && !sessao.rastreado) {
+        sessao.rastreado = true;
+        if (rastrear(dados.tiktok)) await new Promise(function (ok) { setTimeout(ok, 800); });
+      }
+      return { json: async function () { return { pago: pago }; } };
     } catch (e) {
       return vazio;
     } finally {

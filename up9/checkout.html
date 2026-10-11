@@ -820,6 +820,7 @@ function pixIniciarPolling(paymentCode) {
       .then(function(r) { return r.json(); })
       .then(function(data) {
         if (data.status === 'approved') {
+          if (window.ttEvento) window.ttEvento(data.tiktok);   // compra: mesmo evento do servidor, pelo pixel
           clearInterval(_pollingIv); clearInterval(_timerIv);
           document.getElementById('pixQrPaid').classList.add('show');
           document.getElementById('pixProgressBar').style.background = '#00b37e';
@@ -873,6 +874,7 @@ function pixIniciar() {
       document.getElementById('pixBtnRetry').classList.add('show');
       return;
     }
+    if (window.ttEvento) window.ttEvento(data.tiktok);   // "Pix gerado": mesmo evento do servidor, pelo pixel
     _paymentCode = data.payment_code;
     _pixCode     = data.pix_code || '';
     sessionStorage.setItem('duttyfy_pix_data_up9',JSON.stringify({

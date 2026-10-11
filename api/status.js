@@ -1,6 +1,10 @@
 // GET /api/status?f=<etapa>&code=<transaction_id>
-// Consulta a FlevoPay. Quando o Pix aparece como aprovado, dispara o Purchase na Events API do TikTok.
-const { STEPS, queryDaPagina, flevo, enviarCompraTikTok } = require("./_lib");
+// Consulta a FlevoPay. Quando o Pix aparece como aprovado, dispara a compra na Events API do TikTok
+// com o clique e o navegador desta requisição, e devolve o mesmo evento para a página disparar pelo pixel.
+const {
+  STEPS, queryDaPagina, flevo, clienteDaTransacao, contextoDoNavegador, eventoDeCompra, eventoParaOPixel,
+  enviarEventoTikTok,
+} = require("./_lib");
 
 module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
@@ -23,18 +27,15 @@ module.exports = async function handler(req, res) {
 
     if (t.status !== "approved") return res.status(200).json({ status: t.status });
 
-    const cliente = (t.customer_data && (t.customer_data.customer || t.customer_data)) || {};
-    await enviarCompraTikTok({
-      req,
-      codigo: t.external_id,   // mesmo event_id do webhook: o TikTok descarta o segundo envio
+    const compra = {
+      evento: eventoDeCompra(),
+      eventId: "purchase_" + t.external_id,   // mesmo id do webhook: o TikTok descarta o segundo envio
       step,
-      valorCentavos: cfg.amount,
-      email: cliente.email,
-      telefone: cliente.phone,
-      query: queryDaPagina(req, ""),
-    });
+      cliente: clienteDaTransacao(t),
+    };
+    await enviarEventoTikTok({ ...compra, contexto: contextoDoNavegador(req, queryDaPagina(req, "")) });
 
-    return res.status(200).json({ status: "approved", obrigado_url: cfg.next || "" });
+    return res.status(200).json({ status: "approved", obrigado_url: cfg.next || "", tiktok: eventoParaOPixel(compra) });
   } catch (e) {
     console.error("Erro ao consultar Pix:", e);
     return res.status(200).json({ status: "pending" });

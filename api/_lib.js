@@ -86,8 +86,8 @@ async function lerCorpo(req) {
 }
 
 async function flevo(caminho, opcoes = {}) {
-  const chave = env("FLEVOPAY_SECRET");
-  if (!chave) throw new Error("FLEVOPAY_SECRET não configurada");
+  const chave = env("FLEVOPAY_SECRET") || env("FLEVOPAY_SECRET_KEY");
+  if (!chave) throw new Error("FLEVOPAY_SECRET (ou FLEVOPAY_SECRET_KEY) não configurada");
   const r = await fetch(FLEVO_BASE + caminho, {
     ...opcoes,
     headers: { "X-API-Key": chave, "Content-Type": "application/json", ...(opcoes.headers || {}) },
@@ -95,18 +95,6 @@ async function flevo(caminho, opcoes = {}) {
   let dados = null;
   try { dados = await r.json(); } catch (e) { /* resposta sem JSON */ }
   return { ok: r.ok, status: r.status, dados };
-}
-
-// A FlevoPay não assina o webhook. Cada cobrança leva um token HMAC (feito com a chave secreta e a
-// referência) no próprio postback_url; só quem conhece a chave consegue gerar um token válido.
-function tokenDoWebhook(reference) {
-  return crypto.createHmac("sha256", env("FLEVOPAY_SECRET")).update(String(reference)).digest("hex").slice(0, 32);
-}
-
-function tokenValido(reference, recebido) {
-  const esperado = Buffer.from(tokenDoWebhook(reference));
-  const dado = Buffer.from(String(recebido || ""));
-  return esperado.length === dado.length && crypto.timingSafeEqual(esperado, dado);
 }
 
 // Endereço público do site (SITE_URL, ou o host da requisição), usado no postback_url.
@@ -123,72 +111,149 @@ function etapaDaReferencia(reference) {
   return Object.prototype.hasOwnProperty.call(STEPS, etapa) ? etapa : "";
 }
 
-// Busca a transação pela referência, direto na FlevoPay. É a fonte da verdade do webhook.
+// Busca a transação pela referência, direto na FlevoPay. Usada pelo webhook quando ele não recebe o id.
+// Uma referência pode ter mais de uma linha lá (cobranças duplicadas antigas): vale a aprovada.
 async function transacaoPorReferencia(reference) {
   const r = await flevo("/query?action=list_transactions&external_id=" + encodeURIComponent(reference));
   if (!r.ok || !Array.isArray(r.dados)) throw new Error("FlevoPay respondeu " + r.status + " na consulta por referência");
-  return r.dados.find((t) => t && t.external_id === reference) || null;
+  const mesmas = r.dados.filter((t) => t && t.external_id === reference);
+  return mesmas.find((t) => t.status === "approved") || mesmas[0] || null;
 }
 
-// Evento de compra pela Events API do TikTok (servidor -> TikTok).
-// event_id fixo por transação (a referência): se o evento for reenviado, o TikTok descarta a duplicata.
-// `contexto` substitui o que normalmente vem da requisição do cliente, no caso do webhook,
-// que chega da FlevoPay e não do navegador: { ip, userAgent, ttclid, ttp, url }.
-async function enviarCompraTikTok({ req, codigo, step, valorCentavos, email, telefone, query, contexto }) {
+// Dados do cliente de uma transação: o que a FlevoPay guardou ou, na falta, o que veio no aviso dela.
+function clienteDaTransacao(t, corpo) {
+  const c = (t && t.customer_data && (t.customer_data.customer || t.customer_data)) || (corpo && corpo.customer) || {};
+  return { email: c.email, telefone: c.phone, documento: c.document };
+}
+
+// ---------------------------------------------------------------------------------------------
+//  TikTok
+// ---------------------------------------------------------------------------------------------
+
+// Nome do evento de venda. "Purchase" é o padrão atual do TikTok; quem otimiza campanha pelo nome
+// antigo pode trocar pela variável TIKTOK_EVENT_NAME (ex.: CompletePayment).
+function eventoDeCompra() {
+  return env("TIKTOK_EVENT_NAME") || "Purchase";
+}
+
+// Página do checkout de cada etapa (vira o page.url quando o evento sai do webhook).
+function paginaDaEtapa(step) {
+  return step === "front" ? "/front/checkout-paradise.html" : "/" + step + "/checkout.html";
+}
+
+// O que liga o evento ao clique no anúncio, lido da requisição do próprio navegador.
+function contextoDoNavegador(req, query) {
+  return {
+    ip: ipDoCliente(req),
+    userAgent: String(req.headers["user-agent"] || ""),
+    ttclid: (query && query.get("ttclid")) || lerCookie(req, "ttclid"),   // da URL ou do cookie do pixel
+    ttp: lerCookie(req, "_ttp"),
+    url: String(req.headers.referer || ""),
+  };
+}
+
+// Identificadores do cliente no formato do TikTok (SHA-256). Os mesmos valores vão para o pixel do
+// navegador (ttq.identify): assim o TikTok reconhece a mesma pessoa no navegador e no servidor, e em
+// todos os eventos dela (o external_id é o CPF, igual do "Pix gerado" até a compra).
+function identidadeTikTok({ email, telefone, documento } = {}) {
+  const id = {};
+  if (email) id.email = sha256(email);
+  const fone = soDigitos(telefone);
+  // DDD 55 existe (RS): só é código do país quando sobram dígitos para DDD + número.
+  if (fone) id.phone_number = sha256("+" + (fone.length >= 12 && fone.startsWith("55") ? fone : "55" + fone));
+  const doc = soDigitos(documento);
+  if (doc) id.external_id = sha256(doc);
+  return id;
+}
+
+// O mesmo evento, no formato que a página repassa ao pixel (window.ttEvento, em /api/tt.js).
+function eventoParaOPixel({ evento, eventId, step, cliente }) {
+  return {
+    event: evento,
+    event_id: eventId,
+    value: STEPS[step].amount / 100,
+    currency: "BRL",
+    content_id: step,
+    content_name: STEPS[step].name,
+    user: identidadeTikTok(cliente),
+  };
+}
+
+// Evento pela Events API do TikTok (servidor -> TikTok).
+// `eventId` é fixo por transação: o mesmo evento mandado de novo (webhook e /api/status, ou o pixel do
+// navegador com o mesmo id) é descartado ou fundido pelo TikTok, nunca contado em dobro.
+// `contexto`: { ip, userAgent, ttclid, ttp, url }. `prazo`: tempo máximo, em ms, somando as tentativas.
+async function enviarEventoTikTok({ evento, eventId, step, cliente, contexto, prazo = 7000 }) {
   const pixel = env("TIKTOK_PIXEL_ID");
   const token = env("TIKTOK_ACCESS_TOKEN");
-  if (!pixel || !token) return;
+  if (!pixel || !token) return false;
 
   const ctx = contexto || {};
+  const id = identidadeTikTok(cliente);
   const user = {};
-  const ip = ctx.ip || (contexto ? "" : ipDoCliente(req));
-  const ua = ctx.userAgent || (contexto ? "" : String(req.headers["user-agent"] || ""));
-  if (ip) user.ip = ip;
-  if (ua) user.user_agent = ua;
-  if (email) user.email = sha256(email);
-  const fone = soDigitos(telefone);
-  if (fone) user.phone = sha256("+" + (fone.startsWith("55") ? fone : "55" + fone));
-  user.external_id = sha256(codigo);
-  const ttclid = ctx.ttclid || (query && query.get("ttclid"));
-  if (ttclid) user.ttclid = ttclid;
-  const ttp = ctx.ttp || (contexto ? "" : lerCookie(req, "_ttp"));
-  if (ttp) user.ttp = ttp;
+  if (id.email) user.email = id.email;
+  // A Events API usa "phone"; "phone_number" vai junto por garantia (chave a mais é ignorada).
+  if (id.phone_number) { user.phone = id.phone_number; user.phone_number = id.phone_number; }
+  if (id.external_id) user.external_id = id.external_id;
+  if (ctx.ttclid) user.ttclid = ctx.ttclid;
+  if (ctx.ttp) user.ttp = ctx.ttp;
+  if (ctx.ip) user.ip = ctx.ip;
+  if (ctx.userAgent) user.user_agent = ctx.userAgent;
 
-  const corpo = {
-    event_source: "web",
-    event_source_id: pixel,
-    data: [{
-      event: "Purchase",
-      event_time: Math.floor(Date.now() / 1000),
-      event_id: "purchase_" + codigo,
-      user,
-      properties: {
-        currency: "BRL",
-        value: valorCentavos / 100,
-        content_type: "product",
-        contents: [{ content_id: step, content_name: STEPS[step].name, quantity: 1, price: valorCentavos / 100 }],
-      },
-      page: { url: ctx.url || (contexto ? "" : req.headers.referer || ""), referrer: "" },
-    }],
+  const valor = STEPS[step].amount / 100;
+  const dado = {
+    event: evento,
+    event_time: Math.floor(Date.now() / 1000),
+    event_id: eventId,
+    user,
+    properties: {
+      currency: "BRL",
+      value: valor,
+      content_type: "product",
+      contents: [{ content_id: step, content_name: STEPS[step].name, quantity: 1, price: valor }],
+    },
   };
+  if (ctx.url) dado.page = { url: ctx.url };
 
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), 4000);
-  try {
-    await fetch(TIKTOK_EVENTS, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Access-Token": token },
-      body: JSON.stringify(corpo),
-      signal: ctl.signal,
-    });
-  } catch (e) {
-    /* medição nunca pode atrapalhar a confirmação da venda */
-  } finally {
-    clearTimeout(timer);
+  const corpo = { event_source: "web", event_source_id: pixel, data: [dado] };
+  // Com TIKTOK_TEST_EVENT_CODE definido, o evento aparece em "Testar eventos" no Events Manager.
+  const teste = env("TIKTOK_TEST_EVENT_CODE");
+  if (teste) corpo.test_event_code = teste;
+
+  const resumo = evento + " " + eventId + " [" + Object.keys(user).join(",") + "]";
+  const fim = Date.now() + prazo;
+  for (let tentativa = 1; tentativa <= 2; tentativa++) {
+    const resta = fim - Date.now();
+    if (resta < 500) break;
+    try {
+      const r = await fetch(TIKTOK_EVENTS, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Access-Token": token },
+        body: JSON.stringify(corpo),
+        signal: AbortSignal.timeout(Math.min(3500, resta)),
+      });
+      // O TikTok responde HTTP 200 mesmo quando recusa o evento; o erro vem em "code" no corpo.
+      const texto = await r.text();
+      let codigo = null;
+      try { codigo = JSON.parse(texto).code; } catch (e) { /* resposta sem JSON */ }
+      if (r.ok && codigo === 0) {
+        console.log("[tiktok] aceito:", resumo);
+        return true;
+      }
+      console.error("[tiktok] recusado:", resumo, "http " + r.status, texto.slice(0, 300));
+      // Erro de dados ou de credencial: mandar de novo não muda a resposta.
+      if (r.status < 500 && r.status !== 429) return false;
+    } catch (e) {
+      // Medição nunca pode atrapalhar a venda: registra e segue.
+      console.error("[tiktok] sem resposta:", resumo, String((e && e.message) || e));
+    }
   }
+  return false;
 }
 
 module.exports = {
   STEPS, env, soDigitos, cpfValido, telefoneValido, reais, lerCookie, queryDaPagina, lerCorpo, flevo,
-  tokenDoWebhook, tokenValido, urlBase, etapaDaReferencia, transacaoPorReferencia, enviarCompraTikTok,
+  urlBase, etapaDaReferencia, transacaoPorReferencia, clienteDaTransacao,
+  eventoDeCompra, paginaDaEtapa, contextoDoNavegador, identidadeTikTok, eventoParaOPixel,
+  enviarEventoTikTok,
 };
