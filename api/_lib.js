@@ -1,6 +1,16 @@
 // Código compartilhado pelos endpoints. O "_" no nome impede a Vercel de expor este arquivo como rota.
 const crypto = require("crypto");
 
+// O Node 24 emite o aviso DEP0169 quando alguém chama url.parse(). Este projeto não chama: o aviso
+// nasce na camada da própria Vercel, quando a função faz uma chamada externa, e aparece nos logs como
+// erro vermelho a cada função iniciada. Fica de fora (só ele) para um erro de verdade não se perder.
+const emitirAviso = process.emitWarning;
+process.emitWarning = function (aviso, ...resto) {
+  const codigo = (resto[0] && resto[0].code) || resto[1] || (aviso && aviso.code);
+  if (codigo === "DEP0169") return;
+  return emitirAviso.call(this, aviso, ...resto);
+};
+
 const FLEVO_BASE = "https://pagamento-processador.org.ua/api/v1";
 const TIKTOK_EVENTS = "https://business-api.tiktok.com/open_api/v1.3/event/track/";
 
