@@ -102,8 +102,50 @@
 
   var sessoes = Object.create(null);
 
-  async function criar(api, dados) {
+  // Um Pix gerado vale 15 min. Enquanto vale, a mesma pessoa (CPF) na mesma etapa reaproveita o
+  // mesmo codigo em vez de criar outra cobranca; e duas chamadas ao mesmo tempo viram uma so.
+  var VALIDADE_PIX = 15 * 60 * 1000;
+  var emAndamento = Object.create(null);
+
+  function chaveCache() { return 'pix_gerado:' + endpoints().criar; }
+
+  function lerCache(cpf) {
     try {
+      var c = JSON.parse(sessionStorage.getItem(chaveCache()) || 'null');
+      if (c && c.cpf === cpf && c.pix_code && c.payment_code && Date.now() - c.inicio < VALIDADE_PIX) return c;
+    } catch (e) { /* storage bloqueado */ }
+    return null;
+  }
+
+  function gravarCache(cpf, pixCode, id, inicio) {
+    try {
+      sessionStorage.setItem(chaveCache(), JSON.stringify({ cpf: cpf, pix_code: pixCode, payment_code: id, inicio: inicio }));
+    } catch (e) { /* storage bloqueado */ }
+  }
+
+  function criar(api, dados) {
+    var chave = chaveCache();
+    if (emAndamento[chave]) return emAndamento[chave];
+    var p = criarPix(api, dados).then(
+      function (r) { delete emAndamento[chave]; return r; },
+      function (e) { delete emAndamento[chave]; throw e; }
+    );
+    emAndamento[chave] = p;
+    return p;
+  }
+
+  async function criarPix(api, dados) {
+    try {
+      var cpfLimpo = soDigitos(dados.cpf);
+      var guardado = lerCache(cpfLimpo);
+      if (guardado) {
+        sessoes[guardado.payment_code] = sessoes[guardado.payment_code] ||
+          { inicio: guardado.inicio, ultima: 0, pendente: false };
+        var img = await imagemDoCodigo(guardado.pix_code);
+        return { ok: true, json: async function () { return {
+          qr_code: guardado.pix_code, qr_code_base64: img, transaction_id: guardado.payment_code
+        }; } };
+      }
       var resposta = await fetch(endpoints().criar, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -126,6 +168,7 @@
       } catch (e) { /* storage bloqueado */ }
       var id = corpo.payment_code;
       sessoes[id] = { inicio: Date.now(), ultima: 0, pendente: false };
+      gravarCache(cpfLimpo, corpo.pix_code, id, sessoes[id].inicio);
       var imagem = await imagemDoCodigo(corpo.pix_code);
       return { ok: true, json: async function () { return {
         qr_code: corpo.pix_code, qr_code_base64: imagem, transaction_id: id

@@ -6,6 +6,17 @@ const {
   tokenDoWebhook, urlBase, lerCookie,
 } = require("./_lib");
 
+// Mesma etapa + mesmo CPF dentro da validade do Pix devolve o Pix que ja existe, em vez de abrir outra
+// cobranca na FlevoPay (cliques repetidos, "tentar de novo", varias abas). Fica na memoria da instancia:
+// protege as chamadas em sequencia; o front tambem reaproveita o Pix (api-pix.js).
+const VALIDADE_MS = 15 * 60 * 1000;
+const recentes = new Map();   // "etapa:cpf" -> { inicio, resultado } | { inicio, promessa }
+
+function limparVencidos() {
+  const agora = Date.now();
+  for (const [k, v] of recentes) if (agora - v.inicio > VALIDADE_MS) recentes.delete(k);
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader("Cache-Control", "no-store");
   if (req.method !== "POST") return res.status(405).json({ error: "Método não permitido." });
@@ -50,7 +61,8 @@ module.exports = async function handler(req, res) {
     postbackUrl = `${base}/api/webhook?${p}`;
   }
 
-  try {
+  async function criarCobranca() {
+    const t0 = Date.now();
     const r = await flevo("/transaction", {
       method: "POST",
       body: JSON.stringify({
@@ -65,17 +77,38 @@ module.exports = async function handler(req, res) {
     });
 
     const d = r.dados || {};
+    console.log("[pix] FlevoPay respondeu", JSON.stringify({ reference, http: r.status, ms: Date.now() - t0, id: d.transaction_id }));
     if (!r.ok || d.status !== "success" || !d.qr_code || !d.transaction_id) {
       console.error("FlevoPay recusou a criação:", r.status, JSON.stringify(d));
+      return null;
+    }
+    return { pix_code: d.qr_code, payment_code: String(d.transaction_id), price_label: reais(cfg.amount) };
+  }
+
+  const chave = `${step}:${cpf}`;
+  // Diagnostico: cada linha e uma chamada a /api/pix (aparece nos Logs da Vercel).
+  console.log("[pix] chamada", JSON.stringify({
+    step, reference, repetida: recentes.has(chave),
+    referer: String(req.headers.referer || "").slice(0, 120),
+    ua: String(req.headers["user-agent"] || "").slice(0, 80),
+  }));
+  try {
+    limparVencidos();
+    let existente = recentes.get(chave);
+    if (!existente) {
+      existente = { inicio: Date.now() };
+      existente.promessa = criarCobranca();
+      recentes.set(chave, existente);
+    }
+    // Chamadas simultaneas esperam a mesma criacao; se falhar, libera a chave para tentar de novo.
+    const resultado = await existente.promessa;
+    if (!resultado) {
+      if (recentes.get(chave) === existente) recentes.delete(chave);
       return res.status(502).json({ error: "Não foi possível gerar o Pix. Tente novamente." });
     }
-
-    return res.status(200).json({
-      pix_code: d.qr_code,
-      payment_code: String(d.transaction_id),
-      price_label: reais(cfg.amount),
-    });
+    return res.status(200).json(resultado);
   } catch (e) {
+    if (recentes.get(chave)?.promessa) recentes.delete(chave);
     console.error("Erro ao criar Pix:", e);
     return res.status(500).json({ error: "Erro interno ao gerar o Pix." });
   }

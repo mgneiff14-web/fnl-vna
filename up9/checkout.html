@@ -833,7 +833,10 @@ function pixIniciarPolling(paymentCode) {
   }, 5000);
 }
 
+var _criando = false;
 function pixIniciar() {
+  if (_criando) return;   // evita criar duas cobrancas por chamadas repetidas
+  _criando = true;
   _pixCode = null; _paymentCode = null;
   clearInterval(_pollingIv); clearInterval(_timerIv);
 
@@ -863,7 +866,7 @@ function pixIniciar() {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ nome: nome, email: email, cpf: savedLead.cpf || '', telefone: savedLead.telefone || '', utm: window.location.search.replace(/^\?/, ''), url_full: window.location.href })
   })
-  .then(function(res) { return res.json(); })
+  .then(function(res) { _criando = false; return res.json(); }, function(e) { _criando = false; throw e; })
   .then(function(data) {
     if (data.error || !data.payment_code) {
       pixSetStatus('Erro ao gerar PIX. Tente novamente.','err');
